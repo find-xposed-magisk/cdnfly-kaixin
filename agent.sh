@@ -82,11 +82,25 @@ check_sys(){
 
 # 安装依赖
 install_depend() {
+    if [[ -f /etc/needrestart/needrestart.conf  ]];then
+        sed -i "s/#\$nrconf{restart} = 'i';/\$nrconf{restart} = 'a';/" /etc/needrestart/needrestart.conf 
+    fi
+
     if check_sys sysRelease ubuntu;then
         apt-get update
-        apt-get -y install wget python-minimal
+        if [[ `cat /etc/issue | grep 22.04` != "" ]];then
+            apt-get -y install wget python2-minimal cron curl iptables
+
+        else
+            apt-get -y install wget python-minimal cron curl iptables
+
+        fi
+    elif check_sys sysRelease debian;then
+        apt-get update
+        apt-get -y install wget python2-minimal cron curl
+    
     elif check_sys sysRelease centos;then
-        yum install -y wget python
+        yum install -y wget python curl
     fi    
 }
 
@@ -113,6 +127,8 @@ download(){
   fi
   echo -e $url | while read l;do
     echo "using url:"$l
+    echo "wget --dns-timeout=5 --connect-timeout=5 --read-timeout=10 --tries=2 "$l" -O $filename " >> ./log.txt
+    echo "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD $l"
     wget --dns-timeout=5 --connect-timeout=5 --read-timeout=10 --tries=2 "$l" -O $filename && break
   done
   
@@ -125,14 +141,23 @@ import platform
 import re
 
 sys_ver = platform.platform()
-sys_ver = re.sub(r'.*-with-(.*)-.*',"\g<1>",sys_ver)
+sys_ver = re.sub(r'.*-with-(.*)','\g<1>',sys_ver)
 if sys_ver.startswith("centos-7"):
     sys_ver = "centos-7"
 if sys_ver.startswith("centos-6"):
     sys_ver = "centos-6"
+if sys_ver.startswith("debian-11"):
+    sys_ver = "debian-11"
+
+if sys_ver.startswith("Ubuntu-16.04"):
+    sys_ver = "Ubuntu-16.04"
+
+if sys_ver.startswith("Ubuntu-22.04"):
+    sys_ver = "Ubuntu-22.04"
+
 print sys_ver
 EOF
-echo `python /tmp/sys_ver.py`
+echo `python2 /tmp/sys_ver.py`
 }
 
 sync_time(){
@@ -143,10 +168,11 @@ sync_time(){
         apt-get -y install ntpdate wget
         /usr/sbin/ntpdate -u pool.ntp.org || true
         ! grep -q "/usr/sbin/ntpdate -u pool.ntp.org" /var/spool/cron/crontabs/root > /dev/null 2>&1 && echo '*/10 * * * * /usr/sbin/ntpdate -u pool.ntp.org > /dev/null 2>&1 || (date_str=`curl update.cdnfly.cn/common/datetime` && timedatectl set-ntp false && echo $date_str && timedatectl set-time "$date_str" )'  >> /var/spool/cron/crontabs/root
-        service cron restart
+        service cron restart || systemctl restart cron || true
     elif check_sys sysRelease centos; then
         yum -y install ntpdate wget
         /usr/sbin/ntpdate -u pool.ntp.org || true
+	touch /var/spool/cron/root
         ! grep -q "/usr/sbin/ntpdate -u pool.ntp.org" /var/spool/cron/root > /dev/null 2>&1 && echo '*/10 * * * * /usr/sbin/ntpdate -u pool.ntp.org > /dev/null 2>&1 || (date_str=`curl update.cdnfly.cn/common/datetime` && timedatectl set-ntp false && echo $date_str && timedatectl set-time "$date_str" )' >> /var/spool/cron/root
         service crond restart
     fi
@@ -163,24 +189,38 @@ sync_time(){
 }
 
 need_sys() {
-    SYS_VER=`python -c "import platform;import re;sys_ver = platform.platform();sys_ver = re.sub(r'.*-with-(.*)-.*','\g<1>',sys_ver);print sys_ver;"`
+    SYS_VER=`python2 -c "import platform;import re;sys_ver = platform.platform();sys_ver = re.sub(r'.*-with-(.*)','\g<1>',sys_ver);print sys_ver;"`
     if [[ $SYS_VER =~ "Ubuntu-16.04" ]];then
-      echo "$sys_ver"
+      echo "$SYS_VER"
+
+    elif [[ $SYS_VER =~ "Ubuntu-22.04" ]];then
+      echo   "$SYS_VER"
+
     elif [[ $SYS_VER =~ "centos-7" ]]; then
       SYS_VER="centos-7"
       echo $SYS_VER
+    elif [[ $SYS_VER =~ "debian-11" ]]; then
+      SYS_VER="debian-11"
+      echo $SYS_VER
+      
     else  
-      echo "目前只支持ubuntu-16.04和Centos-7"
+      echo "目前只支持ubuntu-16.04,ubuntu-22.04,debian-11和Centos-7"
       exit 1
     fi
 }
+
+# 节点不能安装在主控服务器上
+if [[ -d "/opt/cdnfly/master" ]];then
+    echo "当前机器已安装主控程序，不能再安装节点程序了"
+    exit 1
+fi
 
 install_depend
 need_sys
 sync_time
 
 # 解析命令行参数
-TEMP=`getopt -o h --long help,master-ver:,agent-ver:,master-ip:,es-ip:,es-pwd:,ignore-ntp -- "$@"`
+TEMP=`getopt -o h --long help,master-ver:,agent-ver:,master-ip:,master-host:,es-ip:,es-pwd:,ignore-ntp -- "$@"`
 if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
 eval set -- "$TEMP"
 
@@ -218,7 +258,7 @@ else
     second_part=$(printf "%02d\n" `echo $MASTER_VER  | awk -F'.' '{print $2}'`)
     third_part=$(printf "%02d\n" `echo $MASTER_VER  | awk -F'.' '{print $3}'`)
     version_num="$first_part$second_part$third_part"
-    agent_ver=`(curl -s -m 5 "http://auth.cdnfly.cn/master/upgrades?version_num=$version_num") | grep -Po '"agent_ver":"\d+"' | grep -Po "\d+" || true`
+    agent_ver=`(curl -v -m 5 "https://update-cn.cdnfly.cn/master/upgrades?version_num=$version_num" || curl -v -m 5 "https://update-us.cdnfly.cn/master/upgrades?version_num=$version_num") | grep -Po '"agent_ver":"\d+"' | grep -Po "\d+" || true`
     if [[ "$agent_ver" == "" ]]; then
         echo "无法获取agent版本"
         exit 1
@@ -236,7 +276,7 @@ fi
 
 cd /opt
 
-download "https://raw.githubusercontent.com/Steady-WJ/cdnfly-kaixin/main/cdnfly/$tar_gz_name" "https://raw.githubusercontent.com/Steady-WJ/cdnfly-kaixin/main/cdnfly/$tar_gz_name" "$tar_gz_name"
+download "https://dl2.cdnfly.cn/agent/cdnfly/$tar_gz_name" "https://us.centos.bz/cdnfly/$tar_gz_name" "$tar_gz_name"
 
 rm -rf $dir_name
 tar xf $tar_gz_name
@@ -247,3 +287,4 @@ mv $dir_name cdnfly
 cd /opt/cdnfly/agent
 chmod +x install.sh
 ./install.sh $@
+
